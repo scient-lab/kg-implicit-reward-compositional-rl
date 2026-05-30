@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Env / secrets
+.env
+*.env
+
+# ML artifacts
+wandb/
+checkpoints/
+*.ckpt
+*.pt
+*.safetensors
+
+# kg-pipeline fork: when KGRL_* env paths point at a relative location,
+# tooling can materialize a literal ~/ directory at repo root (got an
+# unexpanded "~/.cache/..." string). Never commit it.
+~/
+
+# OS / editor / IDE
+.DS_Store
+.vscode/
