@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 from datasets import load_from_disk, Dataset
 import transformers
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
+from peft import PeftModel, LoraConfig, TaskType
 from trl import GRPOConfig, GRPOTrainer
 
 # Import data preprocessing utilities
@@ -364,7 +364,14 @@ def train():
     
     # Setup environment variables
     os.environ["CUDA_MODULE_LOADING"] = "EAGER"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
+    # kg-pipeline fork-patch: original hard-coded
+    #   PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.8
+    # which overrode the caller's `expandable_segments:True`. Honor the caller's
+    # setting (needed on 12 GB consumer GPUs to avoid fragmentation OOMs).
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "max_split_size_mb:128,garbage_collection_threshold:0.8",
+    )
     
     # Parse configuration
     parser = transformers.HfArgumentParser(TrainingConfig)
@@ -419,7 +426,31 @@ def train():
             trust_remote_code=True,
             low_cpu_mem_usage=True,
         )
-        
+
+        # kg-pipeline fork-patch: the SFT script can resize the embedding
+        # layer if the tokenizer added/removed special tokens (it sets
+        # save_embedding_layers=True in that case). Loading the LoRA on top
+        # of a fresh base model then fails with:
+        #   size mismatch for ...embed_tokens.weight:
+        #     checkpoint [N_sft, hidden] vs current [N_base, hidden]
+        # Detect by reading the adapter's saved embedding shape (if present)
+        # and resize the base model to match BEFORE PeftModel loads.
+        try:
+            from safetensors import safe_open
+            ckpt_path = os.path.join(config.sft_checkpoint_path, "adapter_model.safetensors")
+            if os.path.isfile(ckpt_path):
+                with safe_open(ckpt_path, framework="pt") as f:
+                    for k in f.keys():
+                        if "embed_tokens.weight" in k:
+                            new_n = f.get_tensor(k).shape[0]
+                            cur_n = base_model.get_input_embeddings().weight.shape[0]
+                            if new_n != cur_n:
+                                logging.info(f"Resizing base embeddings {cur_n} → {new_n} to match SFT checkpoint")
+                                base_model.resize_token_embeddings(new_n)
+                            break
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"Could not pre-resize embeddings: {e}")
+
         # Load and merge LoRA adapters
         peft_model = PeftModel.from_pretrained(base_model, config.sft_checkpoint_path)
         merged_model = peft_model.merge_and_unload()
@@ -479,7 +510,9 @@ def train():
         logging_steps=1,
         bf16=True,
         num_generations=config.num_generations,
-        max_prompt_length=config.max_prompt_length,
+        # kg-pipeline fork-patch: trl >=0.20 removed `max_prompt_length` from
+        # GRPOConfig. The combined `max_completion_length` (already prompt +
+        # completion) serves as the total budget.
         max_completion_length=config.max_prompt_length + config.max_completion_length,
         generation_kwargs={
             "temperature": 0.6,
@@ -487,7 +520,10 @@ def train():
             "no_repeat_ngram_size": 3,
             "repetition_penalty": 1.15,
         },
-        optim="adamw_torch",
+        # kg-pipeline fork-patch: 8-bit AdamW (bitsandbytes) cuts optimizer
+        # state memory by ~3.5× vs adamw_torch — critical for fitting GRPO
+        # on the 12 GB RTX 3060. Original paper used adamw_torch on A100×8.
+        optim="adamw_8bit",
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         per_device_train_batch_size=config.per_device_train_batch_size,
         num_train_epochs=config.num_train_epochs,
@@ -495,6 +531,9 @@ def train():
         max_grad_norm=config.max_grad_norm,
         output_dir=config.output_dir,
         report_to=[] if config.wandb_project is None else ["wandb"],
+        # kg-pipeline fork-patch: gradient checkpointing trades compute for
+        # activation memory — needed to fit GRPO on a 12 GB GPU.
+        gradient_checkpointing=True,
     )
     
     # Define reward functions
@@ -504,6 +543,23 @@ def train():
         path_alignment_reward_func,
     ]
     
+    # kg-pipeline fork-patch: wrap the merged policy with a fresh LoRA adapter
+    # so GRPO trains <1% of params AND can use the (frozen) base as its own
+    # reference model — avoiding a second 3.5 GB Qwen3-1.7B copy. Without this,
+    # GRPO needs policy (3.5 GB) + reference (3.5 GB) + full gradients (3.5 GB)
+    # + activations → OOM on a 12 GB GPU.
+    rl_lora_config = LoraConfig(
+        r=16,
+        lora_alpha=16,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_dropout=0.05,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+
     # Initialize trainer
     trainer = GRPOTrainer(
         model=model,
@@ -511,6 +567,7 @@ def train():
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset,
+        peft_config=rl_lora_config,
     )
     
     # Train

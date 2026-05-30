@@ -183,7 +183,15 @@ def preprocess_grpo_dataset(
     Returns:
         Processed dataset with 'prompt', 'answer', and 'paths' fields
     """
-    dataset = load_from_disk(dataset_path)[split]
+    # kg-pipeline fork-patch: handle both DatasetDict and flat Dataset on disk.
+    # `data_prep.py --mode rl` saves a flat Dataset (no train/eval splits),
+    # but this loader assumed a DatasetDict. Detect and unwrap.
+    _loaded = load_from_disk(dataset_path)
+    from datasets import Dataset, DatasetDict
+    if isinstance(_loaded, DatasetDict):
+        dataset = _loaded[split]
+    else:
+        dataset = _loaded
     
     def process_batch(batch):
         prompts = []

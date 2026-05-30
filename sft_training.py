@@ -242,7 +242,8 @@ def train():
         save_total_limit=3,
         logging_first_step=True,
         report_to=[] if config.wandb_project is None else ["wandb"],
-        max_seq_length=config.block_size,
+        # kg-pipeline fork-patch: trl >=0.20 renamed `max_seq_length` → `max_length`.
+        max_length=config.block_size,
         gradient_checkpointing=False,
         ddp_find_unused_parameters=False,
     )
