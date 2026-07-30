@@ -522,7 +522,7 @@ def train():
         },
         # kg-pipeline fork-patch: 8-bit AdamW (bitsandbytes) cuts optimizer
         # state memory by ~3.5× vs adamw_torch — critical for fitting GRPO
-        # on the 12 GB RTX 3060. Original paper used adamw_torch on A100×8.
+        # within a constrained VRAM budget. Original paper used adamw_torch on A100×8.
         optim="adamw_8bit",
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         per_device_train_batch_size=config.per_device_train_batch_size,
